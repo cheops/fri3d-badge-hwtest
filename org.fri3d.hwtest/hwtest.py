@@ -5,12 +5,15 @@
 # and microSD (insert/remove at any time).
 # Each button push colour-cycles its NeoPixel (5 buttons <-> 5 LEDs).
 import json
+import logging
 import lvgl as lv
 import mpos
 import machine
 import os
 from machine import Pin
-from mpos import Activity, TaskManager
+from mpos import Activity, TaskManager, LightsManager, LoRaManager
+
+logger = logging.getLogger(__name__)
 
 # status colours
 C_PASS = lv.color_hex(0x2DD36B)
@@ -220,8 +223,8 @@ class HwTest(Activity):
         try:
             for i in range(5):
                 r, g, b = PAL[self.led_state[i]]
-                mpos.lights.set_led(i, r, g, b)
-            mpos.lights.write()
+                LightsManager.set_led(i, r, g, b)
+            LightsManager.write()
         except Exception:
             pass
 
@@ -286,8 +289,8 @@ class HwTest(Activity):
         self.ok['touch'] = False
 
         try:
-            if mpos.lights.is_available():
-                n = mpos.lights.get_led_count()
+            if LightsManager.is_available():
+                n = LightsManager.get_led_count()
                 if n == 5:
                     self.set_status('led', '5 OK', C_PASS); self.ok['led'] = True
                 elif n > 0:
@@ -334,7 +337,7 @@ class HwTest(Activity):
         # Configure LoRa mode with begin(), then read getPacketType(): 1=LoRa,
         # 0xFF = no chip answering (module not installed).
         try:
-            sx = self.board.sx
+            sx = LoRaManager.radioChip
             if sx is None:
                 self.set_status('lora', 'none', C_WARN); self.ok['lora'] = False
             else:
