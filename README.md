@@ -24,12 +24,20 @@ Each of the 5 buttons colour-cycles its own NeoPixel (5 buttons ↔ 5 LEDs).
 | Buttons | A / B / X / Y / **START** (rising-edge, latched) |
 | Joystick | analog off-centre |
 | microSD | live mount + file read (insert/remove reflected) |
-| LoRa (SX1262) | real SPI comms: `begin()` → `getPacketType()` (no TX/RX) |
+| LoRa (SX1262) | real SPI comms: single `standby()` probe (no TX/RX) |
 | Audio | buzzer output present |
 | IR receiver | falling-edge interrupt on GPIO 11 |
 
 Optional hardware (SD / LoRa / Audio / IR) reports **WARN** when absent rather than FAIL,
 and none of them blocks the "all required hardware OK" summary.
+
+**LoRa note:** the display and the LoRa chip share one SPI bus on this board, and the
+underlying MicroPythonOS driver has no reliable way to serialize access between them
+(root cause and a proposed fix filed upstream:
+[MicroPythonOS#222](https://github.com/MicroPythonOS/MicroPythonOS/pull/222)). A LoRa
+module can therefore occasionally read as **???** even when it's present and working —
+this app cannot fully tell "module missing" from "hit this timing issue," so a negative
+reading isn't shown as a confident "no rsp".
 
 ## Requirements
 
@@ -62,17 +70,19 @@ mpremote connect "$BADGE" exec "from mpos import AppManager; AppManager.start_ap
 - **Point an IR remote** at the badge receiver and press → IR flips to **RX OK**.
 - **Insert / remove the SD card** → microSD toggles between **OK** and **no card** within ~2 s.
 
-The hint line turns green **"All required hardware OK"** once the required checks pass.
-The app consumes the back/ESC (X) button so it stays open during testing — leave it by
-resetting the badge.
+The hint line turns green **"All required OK"** once the required checks pass, and always
+reminds you how to leave: a single press of X is consumed (so X itself can still be
+tested), but a quick **double-press of X** quits back to the launcher.
 
 ## Layout
 
 ```
 org.fri3d.hwtest/
 ├── MANIFEST.JSON      # app metadata + launcher intent filter
+├── metadata.json      # BadgeHub store listing metadata
 ├── hwtest.py          # the self-test Activity
-└── icon_64x64.png     # launcher icon
+├── icon_64x64.png     # launcher icon
+└── makerspace.png     # Makerspace Baasrode logo shown on the splash
 ```
 
 ## License
