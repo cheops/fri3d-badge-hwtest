@@ -50,6 +50,11 @@ CELLS = (
 # keys whose PASS is required for the "all good" summary
 REQUIRED = ('disp', 'exp', 'touch', 'led', 'batt', 'imu', 'btn', 'joy')
 
+# LoRa probe retries: each attempt can itself block for several seconds (the
+# SX1262 driver's busy-wait has a 5 s internal timeout), so this is kept small
+# rather than retrying indefinitely -- see _lora_check_loop.
+LORA_MAX_ATTEMPTS = 3
+
 
 def _read_version():
     """Read this app's version from its MANIFEST.JSON ('?' if not found)."""
@@ -106,6 +111,7 @@ class HwTest(Activity):
         self._ir_ok = False
         self._sd_tick = 0
         self._task = None         # the live-update asyncio task
+        self._lora_task = None    # the delayed/retrying LoRa-check task
         self._entered = False     # has the self-test screen been shown?
         self._splash_task = None  # the splash->test timer task
         self.scr = None           # the self-test screen (built later)
@@ -213,6 +219,12 @@ class HwTest(Activity):
             except Exception:
                 pass
         self._task = TaskManager.create_task(self._loop())
+        if self._lora_task is not None:
+            try:
+                self._lora_task.cancel()
+            except Exception:
+                pass
+        self._lora_task = TaskManager.create_task(self._lora_check_loop())
 
     async def _splash_then_enter(self):
         await TaskManager.sleep_ms(SPLASH_MS)
@@ -333,32 +345,63 @@ class HwTest(Activity):
         except Exception:
             self.set_status('audio', '?', C_WARN); self.ok['audio'] = False
 
-        # LoRa (optional Seeed Studio Wio-SX1262-N): real SPI comms check, no TX/RX.
-        # Configure LoRa mode with begin(), then read getPacketType(): 1=LoRa,
-        # 0xFF = no chip answering (module not installed).
+        # LoRa: checked separately in _lora_check_loop (delayed + retried -- see
+        # there for why a single immediate check here is unreliable).
+        self.set_status('lora', '...', C_WAIT); self.ok['lora'] = False
+
+    # ---- LoRa (optional Seeed Studio Wio-SX1262-N): real SPI comms check, no
+    # TX/RX. The display and the LoRa chip share one physical SPI bus on this
+    # board, and the LoRa driver (MicroPythonOS's _sx126x.py) holds its chip-
+    # select line low across a busy-wait before every command. If a display
+    # flush lands in that window the transaction gets corrupted and reads back
+    # as "no chip" even when a module is physically present. A single check is
+    # therefore not reliable, especially right as this screen is first painted
+    # (the busiest moment for display SPI traffic in this app). So: wait a few
+    # seconds for the initial paint to settle, then retry a bounded number of
+    # times -- one real success is enough to prove the module is there, and
+    # there's no correctness reason to keep polling after that. Retries are
+    # capped (LORA_MAX_ATTEMPTS) rather than indefinite: each failed attempt
+    # can itself block for several seconds (the driver's busy-wait has a 5 s
+    # internal timeout), so retrying forever on a badge with no LoRa module
+    # would leave the whole app sluggish for as long as it runs.
+    def _check_lora(self):
+        """One LoRa probe. Returns True if the result is final (no chip
+        configured, or a clean read), False if it should be retried."""
         try:
             sx = LoRaManager.radioChip
             if sx is None:
                 self.set_status('lora', 'none', C_WARN); self.ok['lora'] = False
+                return True  # no LoRa support on this build -- nothing to retry
+            try:
+                sx.standby()
+            except Exception:
+                pass
+            try:
+                sx.begin()  # set LoRa mode (no TX/RX); ignored if chip is in a
+                            # bad state (ERR_WRONG_MODEM) -- we still read below
+            except Exception:
+                pass
+            pt = sx.getPacketType()
+            if pt == 1:
+                self.set_status('lora', 'LoRa', C_PASS); self.ok['lora'] = True
+                return True
+            elif pt == 0:
+                self.set_status('lora', 'FSK', C_PASS); self.ok['lora'] = True
+                return True
             else:
-                try:
-                    sx.standby()
-                except Exception:
-                    pass
-                try:
-                    sx.begin()  # set LoRa mode (no TX/RX); ignored if chip is in a
-                                # bad state (ERR_WRONG_MODEM) -- we still read below
-                except Exception:
-                    pass
-                pt = sx.getPacketType()
-                if pt == 1:
-                    self.set_status('lora', 'LoRa', C_PASS); self.ok['lora'] = True
-                elif pt == 0:
-                    self.set_status('lora', 'FSK', C_PASS); self.ok['lora'] = True
-                else:
-                    self.set_status('lora', 'no rsp', C_WARN); self.ok['lora'] = False
+                self.set_status('lora', 'no rsp', C_WARN); self.ok['lora'] = False
+                return False
         except Exception:
             self.set_status('lora', 'err', C_WARN); self.ok['lora'] = False
+            return False
+
+    async def _lora_check_loop(self):
+        await TaskManager.sleep_ms(3000)  # let the initial screen paint settle
+        for _ in range(LORA_MAX_ATTEMPTS):
+            if self._check_lora():
+                return
+            await TaskManager.sleep_ms(700)
+        # out of attempts -- leave whatever the last _check_lora() call showed
 
     # ---- live (re-)checks: buttons, joystick, touch, IR, SD ----
     def _check_sd(self):
@@ -487,6 +530,8 @@ class HwTest(Activity):
             self._enable_ir()
             if self._task is None:
                 self._task = TaskManager.create_task(self._loop())
+            if self._lora_task is None and not self.ok.get('lora'):
+                self._lora_task = TaskManager.create_task(self._lora_check_loop())
 
     def onPause(self, screen):
         if self._splash_task is not None:
@@ -501,6 +546,12 @@ class HwTest(Activity):
             except Exception:
                 pass
             self._task = None
+        if self._lora_task is not None:
+            try:
+                self._lora_task.cancel()
+            except Exception:
+                pass
+            self._lora_task = None
         self._disable_ir()
         try:
             self.led_state = [OFF, OFF, OFF, OFF, OFF]

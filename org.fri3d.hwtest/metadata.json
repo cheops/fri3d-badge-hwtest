@@ -6,7 +6,7 @@
   "categories": ["Hardware"],
   "author": "David Steeman",
   "license_type": "MIT",
-  "version": "0.4.1",
+  "version": "0.4.2",
   "badges": ["mpos_api_0"],
   "git_url": "https://github.com/steemandavid/fri3d-badge-hwtest"
 }
