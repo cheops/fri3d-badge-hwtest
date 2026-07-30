@@ -47,7 +47,7 @@ mpremote connect "$BADGE" exec "from mpos import AppManager; AppManager.refresh_
 mpremote connect "$BADGE" exec "from mpos import AppManager; AppManager.restart_launcher()"
 ```
 
-"HW Test" then appears in the launcher (alphabetical, around the H's — scroll if needed).
+"Hardware Test" then appears in the launcher (alphabetical, around the H's — scroll if needed).
 Tap it, or launch directly:
 
 ```bash

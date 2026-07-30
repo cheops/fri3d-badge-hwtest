@@ -10,6 +10,7 @@ import lvgl as lv
 import mpos
 import machine
 import os
+import time
 from machine import Pin
 from mpos import Activity, TaskManager, LightsManager, LoRaManager
 
@@ -23,6 +24,7 @@ C_WAIT = lv.color_hex(0x9E9E9E)
 
 FULLNAME = 'org.fri3d.hwtest'
 SPLASH_MS = 1000   # how long the startup splash is shown
+DOUBLE_BACK_MS = 500  # max gap between two X presses to count as a quit
 
 # face buttons read from mpos.io_expander.digital:
 # (usb_plugged, joy_R, joy_L, joy_D, joy_U, MENU, B, A, Y, X, charger_stdby, charger_chg)
@@ -50,10 +52,19 @@ CELLS = (
 # keys whose PASS is required for the "all good" summary
 REQUIRED = ('disp', 'exp', 'touch', 'led', 'batt', 'imu', 'btn', 'joy')
 
-# LoRa probe retries: each attempt can itself block for several seconds (the
-# SX1262 driver's busy-wait has a 5 s internal timeout), so this is kept small
-# rather than retrying indefinitely -- see _lora_check_loop.
-LORA_MAX_ATTEMPTS = 3
+# How long to let any in-flight screen transition settle before the one-shot
+# LoRa probe (see _probe_lora() for why this has to be a single shot). The
+# very first app launched after a fresh boot/reset needs much more time here
+# than any later launch: the launcher only does its full (icon-decoding,
+# grid-building) render once, on its very first onResume(), and caches it
+# after that -- so opening this app right after a reset can land right in
+# the middle of that one-time work, while every later launch in the same
+# boot session hits the launcher's fast cached path instead. Confirmed on
+# hardware: LoRa reads "no rsp" every time right after a reset, and "OK"
+# every time on any later relaunch in that same session.
+LORA_SETTLE_MS = 400          # normal settle delay, most of the time
+LORA_BOOT_SETTLE_MS = 3000    # used instead if we're shortly after boot
+LORA_BOOT_GRACE_MS = 20000    # "shortly after boot" cutoff (time.ticks_ms())
 
 
 def _read_version():
@@ -111,12 +122,62 @@ class HwTest(Activity):
         self._ir_ok = False
         self._sd_tick = 0
         self._task = None         # the live-update asyncio task
-        self._lora_task = None    # the delayed/retrying LoRa-check task
         self._entered = False     # has the self-test screen been shown?
+        self._last_back_ms = None  # timestamp of the previous X/back press
         self._splash_task = None  # the splash->test timer task
         self.scr = None           # the self-test screen (built later)
         self.hint = None
+        self._lora_status = None  # (text, color, ok) filled in by _probe_lora()
+        self._probe_lora()
         self._build_splash()
+
+    # ---- LoRa (optional Seeed Studio Wio-SX1262-N) presence probe ----
+    # The display and the LoRa chip share one physical SPI bus on this board,
+    # and the LoRa driver (MicroPythonOS's sx1262.py) holds its chip-select
+    # line low across a busy-wait before every command, with no coordination
+    # against other devices on that bus. If a display flush lands in that
+    # window the transaction gets corrupted and reads back as "no chip" even
+    # when a module is physically present -- and since this board has no
+    # working reset line for the chip (board init wires a placeholder pin,
+    # not a real reset), a corrupted transaction can leave the chip
+    # unresponsive for the rest of the session with no way to recover it
+    # short of power-cycling the badge. That makes retries far less useful
+    # than they'd first appear: this isn't independent-trials-style noise,
+    # it's closer to "the first probe either lands cleanly or the chip is
+    # stuck for the rest of the session." So instead of retrying, this does
+    # ONE minimal, single-transaction probe (just standby(), not the full
+    # standby()+begin()+getPacketType() sequence, which is a dozen-plus
+    # separate SPI transactions internally), at the quietest moment
+    # available: in onCreate(), before this Activity has built or shown any
+    # screen of its own. A settle delay first covers whatever display work
+    # is still in flight -- see LORA_BOOT_SETTLE_MS above.
+    #
+    # Confirmed on hardware, even with the above: opening this app right
+    # after a reset reads "no coherent response" every time, on a badge
+    # where the module is physically present and every later reopen (same
+    # boot session, no reset) reads back fine. The boot-settle delay reduces
+    # but does not eliminate this. Rather than keep chasing it, a negative
+    # reading is shown as "???" (uncertain), not a confident-looking "no
+    # rsp" -- this probe cannot fully distinguish "module missing" from
+    # "module present but the shared-bus/boot-timing issue hit this probe."
+    def _probe_lora(self):
+        settle = LORA_BOOT_SETTLE_MS if time.ticks_ms() < LORA_BOOT_GRACE_MS else LORA_SETTLE_MS
+        time.sleep_ms(settle)
+        try:
+            sx = LoRaManager.radioChip
+            if sx is None:
+                self._lora_status = ('none', C_WARN, False)
+                return
+            state = sx.standby()
+            if state == 0:  # _ERR_NONE in the driver -- a coherent response
+                self._lora_status = ('OK', C_PASS, True)
+            else:           # e.g. _ERR_CHIP_NOT_FOUND from an all-0xFF status byte --
+                            # confirmed on hardware to also happen with a module
+                            # physically present (see comment above), so '???'
+                            # rather than a confident-looking negative like "no rsp"
+                self._lora_status = ('???', C_WARN, False)
+        except Exception:
+            self._lora_status = ('err', C_WARN, False)
 
     # ---- splash / startup screen ----
     def _build_splash(self):
@@ -201,7 +262,7 @@ class HwTest(Activity):
         self.hint.set_size(312, 20)
         self.hint.set_style_text_align(lv.TEXT_ALIGN.CENTER, 0)
         self.hint.set_style_text_color(C_WAIT, 0)
-        self.hint.set_text('Tap - A/B/X/Y/S - stick - point IR remote')
+        self.hint.set_text('Tap/Btns/Stick/IR - dbl-X quits')
         self.scr = scr
 
     def _enter_test(self):
@@ -219,12 +280,6 @@ class HwTest(Activity):
             except Exception:
                 pass
         self._task = TaskManager.create_task(self._loop())
-        if self._lora_task is not None:
-            try:
-                self._lora_task.cancel()
-            except Exception:
-                pass
-        self._lora_task = TaskManager.create_task(self._lora_check_loop())
 
     async def _splash_then_enter(self):
         await TaskManager.sleep_ms(SPLASH_MS)
@@ -242,7 +297,6 @@ class HwTest(Activity):
 
     def _cycle_led(self, idx):
         self.led_state[idx] = (self.led_state[idx] + 1) % len(PAL)
-        self._render_leds()
 
     # ---- IR receiver (edge interrupt; closure handler, no self in the ISR) ----
     def _enable_ir(self):
@@ -345,63 +399,11 @@ class HwTest(Activity):
         except Exception:
             self.set_status('audio', '?', C_WARN); self.ok['audio'] = False
 
-        # LoRa: checked separately in _lora_check_loop (delayed + retried -- see
-        # there for why a single immediate check here is unreliable).
-        self.set_status('lora', '...', C_WAIT); self.ok['lora'] = False
-
-    # ---- LoRa (optional Seeed Studio Wio-SX1262-N): real SPI comms check, no
-    # TX/RX. The display and the LoRa chip share one physical SPI bus on this
-    # board, and the LoRa driver (MicroPythonOS's _sx126x.py) holds its chip-
-    # select line low across a busy-wait before every command. If a display
-    # flush lands in that window the transaction gets corrupted and reads back
-    # as "no chip" even when a module is physically present. A single check is
-    # therefore not reliable, especially right as this screen is first painted
-    # (the busiest moment for display SPI traffic in this app). So: wait a few
-    # seconds for the initial paint to settle, then retry a bounded number of
-    # times -- one real success is enough to prove the module is there, and
-    # there's no correctness reason to keep polling after that. Retries are
-    # capped (LORA_MAX_ATTEMPTS) rather than indefinite: each failed attempt
-    # can itself block for several seconds (the driver's busy-wait has a 5 s
-    # internal timeout), so retrying forever on a badge with no LoRa module
-    # would leave the whole app sluggish for as long as it runs.
-    def _check_lora(self):
-        """One LoRa probe. Returns True if the result is final (no chip
-        configured, or a clean read), False if it should be retried."""
-        try:
-            sx = LoRaManager.radioChip
-            if sx is None:
-                self.set_status('lora', 'none', C_WARN); self.ok['lora'] = False
-                return True  # no LoRa support on this build -- nothing to retry
-            try:
-                sx.standby()
-            except Exception:
-                pass
-            try:
-                sx.begin()  # set LoRa mode (no TX/RX); ignored if chip is in a
-                            # bad state (ERR_WRONG_MODEM) -- we still read below
-            except Exception:
-                pass
-            pt = sx.getPacketType()
-            if pt == 1:
-                self.set_status('lora', 'LoRa', C_PASS); self.ok['lora'] = True
-                return True
-            elif pt == 0:
-                self.set_status('lora', 'FSK', C_PASS); self.ok['lora'] = True
-                return True
-            else:
-                self.set_status('lora', 'no rsp', C_WARN); self.ok['lora'] = False
-                return False
-        except Exception:
-            self.set_status('lora', 'err', C_WARN); self.ok['lora'] = False
-            return False
-
-    async def _lora_check_loop(self):
-        await TaskManager.sleep_ms(3000)  # let the initial screen paint settle
-        for _ in range(LORA_MAX_ATTEMPTS):
-            if self._check_lora():
-                return
-            await TaskManager.sleep_ms(700)
-        # out of attempts -- leave whatever the last _check_lora() call showed
+        # LoRa: the probe already ran in onCreate(), before any of our own
+        # screens existed -- see _probe_lora() for why. Just display it here.
+        text, color, ok = self._lora_status
+        self.set_status('lora', text, color)
+        self.ok['lora'] = ok
 
     # ---- live (re-)checks: buttons, joystick, touch, IR, SD ----
     def _check_sd(self):
@@ -462,18 +464,28 @@ class HwTest(Activity):
         except Exception:
             pass
 
-        # rising edge -> mark seen + colour-cycle that button's LED
+        # rising edge -> mark seen + colour-cycle that button's LED. Multiple
+        # buttons can show a rising edge in the same poll tick (e.g. pressed
+        # together) -- update led_state for all of them first and issue a
+        # single LightsManager.write() at the end rather than one per button,
+        # since back-to-back writes with no gap between them can upset the
+        # NeoPixel driver's timing-sensitive transmission.
+        leds_changed = False
         for name, _idx, led in FACE:
             now = pressed.get(name, False)
             if now and not self.prev.get(name, False):
                 self.btn_seen.add(name)
                 self._cycle_led(led)
+                leds_changed = True
             self.prev[name] = now
         nows = pressed.get('S', False)
         if nows and not self.prev.get('S', False):
             self.btn_seen.add('S')
             self._cycle_led(4)
+            leds_changed = True
         self.prev['S'] = nows
+        if leds_changed:
+            self._render_leds()
 
         nb = len(self.btn_seen)
         self.set_status('btn', '%d/5' % nb, C_PASS if nb >= 5 else C_WAIT)
@@ -495,10 +507,10 @@ class HwTest(Activity):
 
     def update_summary(self):
         if all(self.ok.get(k) for k in REQUIRED):
-            self.hint.set_text('All required hardware OK')
+            self.hint.set_text('All required OK - dbl-X quits')
             self.hint.set_style_text_color(C_PASS, 0)
         else:
-            self.hint.set_text('Tap - A/B/X/Y/S - stick - point IR remote')
+            self.hint.set_text('Tap/Btns/Stick/IR - dbl-X quits')
             self.hint.set_style_text_color(C_WAIT, 0)
 
     async def _loop(self):
@@ -515,8 +527,25 @@ class HwTest(Activity):
 
     # ---- lifecycle ----
     def onBackPressed(self, screen):
-        # Consume back / ESC (the X button) so the test app stays foreground and
-        # every button can be exercised. Leave by resetting the badge.
+        # X is both "back" and a button under test, so a single press is
+        # consumed (stays foreground, so X itself can still be exercised).
+        # A quick double-press quits, so there's a way out without resetting
+        # the badge.
+        now = time.ticks_ms()
+        if self._last_back_ms is not None and time.ticks_diff(now, self._last_back_ms) <= DOUBLE_BACK_MS:
+            self._last_back_ms = None
+            # onCreate's splash and _enter_test's test screen each opened
+            # their own screen via setContentView(), which pushes a new
+            # activity-stack entry every time -- so this Activity occupies
+            # two stack layers once the test screen is showing (one for the
+            # splash, one for the test grid). A single finish() would only
+            # pop back to our own splash screen instead of the launcher, so
+            # pop both layers when we've gotten that far.
+            self.finish()
+            if self._entered:
+                self.finish()
+            return True  # we're closing ourselves; don't let the framework finish() too
+        self._last_back_ms = now
         return True
 
     def onResume(self, screen):
@@ -530,8 +559,6 @@ class HwTest(Activity):
             self._enable_ir()
             if self._task is None:
                 self._task = TaskManager.create_task(self._loop())
-            if self._lora_task is None and not self.ok.get('lora'):
-                self._lora_task = TaskManager.create_task(self._lora_check_loop())
 
     def onPause(self, screen):
         if self._splash_task is not None:
@@ -546,12 +573,6 @@ class HwTest(Activity):
             except Exception:
                 pass
             self._task = None
-        if self._lora_task is not None:
-            try:
-                self._lora_task.cancel()
-            except Exception:
-                pass
-            self._lora_task = None
         self._disable_ir()
         try:
             self.led_state = [OFF, OFF, OFF, OFF, OFF]

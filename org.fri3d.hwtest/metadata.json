@@ -1,12 +1,12 @@
 {
   "project_type": "app",
-  "name": "HW Test",
+  "name": "Hardware Test",
   "description": "Single-screen PASS/WARN/FAIL hardware self-test for the Fri3d Camp 2026 badge.",
   "long_description": "A single-screen hardware self-test for the Fri3d Camp 2026 badge (MicroPythonOS). Reports PASS/WARN/FAIL for display, IO expander (CH32X035), touch, NeoPixels, battery, IMU, buttons (A/B/X/Y + START), joystick, microSD, LoRa (SX1262 SPI), audio and IR. Inputs are tested interactively (tap, buttons, joystick, IR remote, SD insert/remove) and each button colour-cycles its own NeoPixel. By David Steeman, Makerspace Baasrode.",
   "categories": ["Hardware"],
   "author": "David Steeman",
   "license_type": "MIT",
-  "version": "0.4.2",
+  "version": "0.5.1",
   "badges": ["mpos_api_0"],
   "git_url": "https://github.com/steemandavid/fri3d-badge-hwtest"
 }
