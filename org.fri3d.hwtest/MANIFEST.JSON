@@ -4,7 +4,7 @@
   "short_description": "Hardware self-test (Makerspace Baasrode)",
   "long_description": "Single-screen PASS/WARN/FAIL hardware self-test for the Fri3d Camp 2026 badge: display, IO expander, touch, NeoPixels, battery, IMU, buttons (A/B/X/Y + START), joystick, microSD, LoRa (SX1262), audio and IR. Shows a short startup splash, then the test grid. Hold A/B/X/Y/S, move the stick, tap the screen, point an IR remote, insert/remove SD.",
   "fullname": "org.fri3d.hwtest",
-  "version": "0.5.1",
+  "version": "0.5.2",
   "category": "development",
   "activities": [
     {

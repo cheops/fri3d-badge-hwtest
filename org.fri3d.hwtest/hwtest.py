@@ -131,26 +131,56 @@ class HwTest(Activity):
         self._probe_lora()
         self._build_splash()
 
+    # ---- LoRa hardware reset via the CH32 I/O-expander ----
+    # The SX1262's reset pin isn't wired to the ESP32-S3 directly -- it's
+    # wired through the CH32 microcontroller that also fans out the buttons/
+    # joystick/battery (mpos.io_expander), behind the expander's config
+    # register (bit 4, per MicroPythonOS's own board/fri3d_2026.py, which
+    # uses these same 0x01/0x03/0x13 values at boot). The LoRa driver's own
+    # reset() only toggles a placeholder GPIO with nothing behind it. Found
+    # via lucid-void/fri3d-meshcore issue #7: exp.config = 0x03 holds LoRa
+    # in reset (LCD/aux stay powered), 0x13 releases it.
+    #
+    # UNVERIFIED on hardware (fri3d_2026, CH32 firmware v2.0.1): reading
+    # exp.config back immediately after writing 0x03 shows no change at all
+    # (still whatever it read before the write), while writing a different
+    # expander register (lcd_brightness) via the same i2c-write path takes
+    # effect immediately. So this call may not be physically resetting the
+    # chip on that firmware -- there's no way to confirm from software
+    # alone whether it silently no-ops or is a legitimate self-clearing
+    # pulse that just isn't observable in the readback. Kept because it's a
+    # correct port of the meshcore app's approach and is harmless either
+    # way, but don't treat a clean LoRa probe as proof this reset worked --
+    # the pre-existing shared-SPI-bus flakiness below is just as likely the
+    # explanation for any given run's OK/??? result.
+    def _reset_lora_via_ch32(self):
+        try:
+            exp = mpos.io_expander
+            exp.config = 0x03   # LoRa held in reset, LCD on, aux on
+            time.sleep_ms(100)
+            exp.config = 0x13   # LoRa released, LCD on, aux on
+            time.sleep_ms(100)
+        except Exception:
+            pass
+
     # ---- LoRa (optional Seeed Studio Wio-SX1262-N) presence probe ----
     # The display and the LoRa chip share one physical SPI bus on this board,
     # and the LoRa driver (MicroPythonOS's sx1262.py) holds its chip-select
     # line low across a busy-wait before every command, with no coordination
     # against other devices on that bus. If a display flush lands in that
     # window the transaction gets corrupted and reads back as "no chip" even
-    # when a module is physically present -- and since this board has no
-    # working reset line for the chip (board init wires a placeholder pin,
-    # not a real reset), a corrupted transaction can leave the chip
-    # unresponsive for the rest of the session with no way to recover it
-    # short of power-cycling the badge. That makes retries far less useful
-    # than they'd first appear: this isn't independent-trials-style noise,
-    # it's closer to "the first probe either lands cleanly or the chip is
-    # stuck for the rest of the session." So instead of retrying, this does
-    # ONE minimal, single-transaction probe (just standby(), not the full
-    # standby()+begin()+getPacketType() sequence, which is a dozen-plus
-    # separate SPI transactions internally), at the quietest moment
-    # available: in onCreate(), before this Activity has built or shown any
-    # screen of its own. A settle delay first covers whatever display work
-    # is still in flight -- see LORA_BOOT_SETTLE_MS above.
+    # when a module is physically present. That used to be able to wedge the
+    # chip for the rest of the session with no way to recover it short of
+    # power-cycling the badge -- a real reset line may exist after all (see
+    # _reset_lora_via_ch32() above, and its "UNVERIFIED" note), so this probe
+    # resets the chip before each attempt and retries once (reset again,
+    # re-probe) if the first attempt doesn't read back cleanly, at the
+    # quietest moment available: in onCreate(), before this Activity has
+    # built or shown any screen of its own. A settle delay first covers
+    # whatever display work is still in flight -- see LORA_BOOT_SETTLE_MS
+    # above. Even if the reset call turns out to be a no-op on this
+    # hardware, the retry's extra settle time is harmless and may help on
+    # its own.
     #
     # Confirmed on hardware, even with the above: opening this app right
     # after a reset reads "no coherent response" every time, on a badge
@@ -162,20 +192,23 @@ class HwTest(Activity):
     # "module present but the shared-bus/boot-timing issue hit this probe."
     def _probe_lora(self):
         settle = LORA_BOOT_SETTLE_MS if time.ticks_ms() < LORA_BOOT_GRACE_MS else LORA_SETTLE_MS
-        time.sleep_ms(settle)
         try:
             sx = LoRaManager.radioChip
             if sx is None:
                 self._lora_status = ('none', C_WARN, False)
                 return
-            state = sx.standby()
-            if state == 0:  # _ERR_NONE in the driver -- a coherent response
-                self._lora_status = ('OK', C_PASS, True)
-            else:           # e.g. _ERR_CHIP_NOT_FOUND from an all-0xFF status byte --
-                            # confirmed on hardware to also happen with a module
-                            # physically present (see comment above), so '???'
-                            # rather than a confident-looking negative like "no rsp"
-                self._lora_status = ('???', C_WARN, False)
+            for _ in (1, 2):
+                self._reset_lora_via_ch32()
+                time.sleep_ms(settle)
+                state = sx.standby()
+                if state == 0:  # _ERR_NONE in the driver -- a coherent response
+                    self._lora_status = ('OK', C_PASS, True)
+                    return
+                settle = LORA_SETTLE_MS  # the retry no longer needs the boot-settle delay
+            # e.g. _ERR_CHIP_NOT_FOUND from an all-0xFF status byte -- confirmed on
+            # hardware to also happen with a module physically present (see comment
+            # above), so '???' rather than a confident-looking negative like "no rsp"
+            self._lora_status = ('???', C_WARN, False)
         except Exception:
             self._lora_status = ('err', C_WARN, False)
 

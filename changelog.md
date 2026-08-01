@@ -1,5 +1,77 @@
 # Changelog
 
+## 2026-08-01 — LoRa hardware reset via CH32 expander (v0.5.1 → v0.5.2)
+
+The 2026-07-30 session (below) concluded the LoRa chip had **no working reset line** and
+built the probe around that limitation (single shot, no retries, "???" on ambiguous
+reads). That turned out to be wrong: `lucid-void/fri3d-meshcore`
+[issue #7](https://github.com/lucid-void/fri3d-meshcore/issues/7) found the SX1262's
+reset pin isn't absent — it's wired through the CH32 I/O-expander (the same chip behind
+`mpos.io_expander`) rather than to the ESP32-S3 directly, and is reachable by toggling
+the expander's `config` register: `0x03` holds LoRa in reset (LCD/aux stay powered),
+`0x13` releases it.
+
+Ported that mechanism into `_reset_lora_via_ch32()` in `hwtest.py`. `_probe_lora()` now
+resets the chip before its first `standby()` attempt (was already doing a settle delay
+for the same boot-timing issue, so this piggybacks on it) and, if that read isn't clean,
+resets again and retries once — something the previous version explicitly avoided doing
+because a bad transaction used to wedge the chip for the rest of the session with no way
+back short of a power-cycle. That's no longer true with a real reset available, so the
+retry is now worth doing. Updated the stale "no working reset line" comments in
+`hwtest.py` and the LoRa note in `README.md` accordingly.
+
+Bumped `org.fri3d.hwtest` to **0.5.2**, rebuilt the `.mpk`.
+
+### Flashed and tested on hardware (Devbac8, MAC `90:70:69:01:ba:c8`) — result: unverified
+
+Flashed 0.5.2 to Devbac8 (the other badge stayed untouched, mid-use for unrelated
+development). Instrumented a throwaway debug build (device-only, never committed) to log
+every `exp.config` write and readback, then inspected it after launching the app by
+reaching the live `HwTest` instance through `mpos.activity_navigator.screen_stack` and
+pulling `LORA_DEBUG` out of `onCreate.__globals__` (no module-registry entry exists for
+app entrypoints — they're `exec()`'d into their own namespace, not `import`ed).
+
+**Finding: the CH32 `config` register write appears to be a no-op on this hardware.**
+Reading `exp.config` back immediately after writing `0x03` (and again after `0x13`)
+showed no change at all from whatever it read *before* the write — both times it stayed
+at the board's boot-time default (`0x13`). A control test against a different expander
+register, `lcd_brightness`, wrote and read back correctly on the first try, so the I2C
+write path itself works — this is specific to `config`. Whether the CH32 firmware
+(v2.0.1, confirmed via `exp.version`) actually pulses the reset pin and just doesn't
+reflect it in the readback, or genuinely ignores runtime writes to that register after
+boot-time init, isn't something I can tell from software alone.
+
+Net effect: this can't be reported as a confirmed fix. Kept the code (it's a correct
+port of meshcore's approach, matches the bit layout in MicroPythonOS's own
+`board/fri3d_2026.py`, and is harmless even if inert), but reworded the `hwtest.py`
+comments and README to say the reset's effect is unverified rather than claiming it
+resolves the hang. The LoRa probe's OK/???  result kept varying run-to-run in exactly the
+pattern already described in the pre-existing shared-SPI-bus-timing comments, independent
+of whether the reset call did anything.
+
+Also hit an unrelated scare mid-session: three `mpos.AppManager.start_app()` calls fired
+back-to-back (~5s apart) from overlapping `mpremote exec` sessions left the badge fully
+unresponsive on USB serial (no REPL, no data, even after 20s+). A physical power-cycle
+(by the user) recovered it, and a single clean launch afterward behaved normally with no
+recurrence — most likely overlapping `mpremote` sessions racing for the raw-REPL/USB
+console rather than anything in the LoRa/CH32 code, but noted here since it looked
+alarming in the moment.
+
+Filed upstream:
+[MicroPythonOS/MicroPythonOS#224](https://github.com/MicroPythonOS/MicroPythonOS/issues/224).
+
+### Next steps (not done this session)
+- Confirm with a scope/logic analyzer whether the CH32 physically pulses the LoRa reset
+  pin on a `config` write, since software alone can't distinguish "no-op" from "pulses
+  too fast/self-clears before readback."
+- Check whether `lucid-void/fri3d-meshcore` verified their own reset call actually takes
+  effect, or hit the same unverifiable-readback situation and it just didn't matter for
+  their use case.
+- Worth asking whether a newer CH32 firmware than v2.0.1 is expected to support runtime
+  `config` writes, if v2.0.1 turns out to genuinely ignore them.
+- Watch [MicroPythonOS#224](https://github.com/MicroPythonOS/MicroPythonOS/issues/224)
+  for a maintainer response.
+
 ## 2026-07-30 — Ship the "fix neopixels" PR (v0.4.1 → v0.5.1)
 
 ### Goal

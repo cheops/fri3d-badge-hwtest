@@ -24,7 +24,7 @@ Each of the 5 buttons colour-cycles its own NeoPixel (5 buttons ↔ 5 LEDs).
 | Buttons | A / B / X / Y / **START** (rising-edge, latched) |
 | Joystick | analog off-centre |
 | microSD | live mount + file read (insert/remove reflected) |
-| LoRa (SX1262) | real SPI comms: single `standby()` probe (no TX/RX) |
+| LoRa (SX1262) | real SPI comms: CH32-reset + `standby()` probe, one retry (no TX/RX) |
 | Audio | buzzer output present |
 | IR receiver | falling-edge interrupt on GPIO 11 |
 
@@ -37,7 +37,16 @@ underlying MicroPythonOS driver has no reliable way to serialize access between 
 [MicroPythonOS#222](https://github.com/MicroPythonOS/MicroPythonOS/pull/222)). A LoRa
 module can therefore occasionally read as **???** even when it's present and working —
 this app cannot fully tell "module missing" from "hit this timing issue," so a negative
-reading isn't shown as a confident "no rsp".
+reading isn't shown as a confident "no rsp". The chip's reset pin is wired through the
+CH32 I/O-expander rather than to the ESP32-S3 directly (found via
+[lucid-void/fri3d-meshcore#7](https://github.com/lucid-void/fri3d-meshcore/issues/7)), so
+the probe resets it before each attempt and retries once instead of giving up after one.
+**Unverified on hardware:** on Devbac8 (CH32 firmware v2.0.1), the register write this
+uses doesn't visibly change anything when read back, unlike other expander registers
+that do — so whether this reset actually does anything on that firmware is currently
+unknown; see `changelog.md` (2026-08-01) for the on-device debugging that found this.
+Filed upstream as
+[MicroPythonOS#224](https://github.com/MicroPythonOS/MicroPythonOS/issues/224).
 
 ## Requirements
 
